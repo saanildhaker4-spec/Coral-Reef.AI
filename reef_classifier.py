@@ -73,7 +73,13 @@ def load_audio(path):
         print(f"WARNING: Could not read {path}: {e}")
         return None
 
-    x = x.astype(np.float64)
+    # Integer PCM -> [-1, 1] so 16-bit and float WAVs give the same features
+    if x.dtype == np.uint8:
+        x = (x.astype(np.float64) - 128) / 128
+    elif np.issubdtype(x.dtype, np.integer):
+        x = x.astype(np.float64) / -np.iinfo(x.dtype).min
+    else:
+        x = x.astype(np.float64)
 
     # Stereo -> mono
     if x.ndim > 1:
