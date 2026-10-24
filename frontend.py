@@ -3,10 +3,11 @@ Coral-Reef.AI - front end (Streamlit)
 
 Run from the repo folder:
     pip install -r requirements.txt
-    streamlit run app.py
+    streamlit run frontend.py
 
-Uses the team's reef_classifier.py directly (same features, same
-acoustic-richness scoring), so results match `python reef_classifier.py --auto-label`.
+Uses the team's reef_classifier.py directly (same features, same logistic
+regression), trained the same way as
+`python reef_classifier.py --train-csv metadata.csv --predict-csv unlabeled.csv`.
 """
 import csv
 import io
@@ -28,19 +29,26 @@ METADATA = ROOT / "metadata.csv"
 PREDICTIONS = ROOT / "predictions.csv"
 BUOY_IMAGE = ROOT / "assets" / "buoy.png"
 
+# Same order reef_classifier.main() uses for the model's inputs
 FEATURE_NAMES = [
     "rms_db", "centroid", "rolloff", "flatness", "spectral_entropy",
     "band_shrimp", "band_fish", "band_low", "band_high",
     "shrimp_fish_ratio", "aci", "zcr",
 ]
-# Same four features reef_classifier.py uses for its richness score
-RICHNESS = ["aci", "spectral_entropy", "band_shrimp", "band_fish"]
 
 FEATURE_INFO = {
-    "aci": "Acoustic Complexity Index: how much the sound changes over time",
+    "rms_db": "Overall loudness",
+    "centroid": "Average pitch of the sound (centre of the spectrum)",
+    "rolloff": "Frequency below which 85% of the energy sits",
+    "flatness": "Hiss-like (flat) versus tonal (peaky) sound",
     "spectral_entropy": "How spread out the sound is across frequencies",
     "band_shrimp": "Energy at 2-10 kHz (snapping shrimp crackle)",
     "band_fish": "Energy at 100 Hz-2 kHz (fish calls, grunts)",
+    "band_low": "Energy at 20-100 Hz (waves, boats, rumble)",
+    "band_high": "Energy at 10-20 kHz",
+    "shrimp_fish_ratio": "Shrimp energy divided by fish energy",
+    "aci": "Acoustic Complexity Index: how much the sound changes over time",
+    "zcr": "Zero-crossing rate: how often the waveform flips sign",
 }
 
 # ------------------------------------------------------------------
@@ -119,74 +127,133 @@ def spectrogram_fig(x, sr, title):
     return fig
 
 
-def richness_scores(feature_dicts):
-    """Exactly the scoring in reef_classifier.main(): z-score the four richness
-    features across the batch, average them, threshold at the median."""
-    X = np.array([[f[n] for n in RICHNESS] for f in feature_dicts], dtype=float)
-    means, stds = X.mean(axis=0), X.std(axis=0)
-    stds[stds == 0] = 1.0
-    score = ((X - means) / stds).mean(axis=1)
-    thr = float(np.median(score))
-    prob = 1.0 / (1.0 + np.exp(-np.clip(score - thr, -50, 50)))
-    return score, prob, score >= thr, (means, stds, thr)
+def path_key(p):
+    return os.path.normcase(os.path.normpath(p))
 
 
-def score_against_reference(feat, ref):
-    means, stds, thr = ref
-    v = np.array([feat[n] for n in RICHNESS], dtype=float)
-    s = float(((v - means) / stds).mean())
-    return float(1.0 / (1.0 + np.exp(-np.clip(s - thr, -50, 50))))
+def to_matrix(feature_dicts):
+    return np.array([[f[n] for n in FEATURE_NAMES] for f in feature_dicts], dtype=float)
 
 
-@st.cache_data(show_spinner="Analysing dataset recordings...")
+@st.cache_data(show_spinner="Analysing labelled recordings...")
 def load_dataset():
-    """Features for every file in metadata.csv that exists on disk."""
-    if not METADATA.exists():
-        return []
+    """Labelled files from metadata.csv that exist on disk. Like reef_classifier's
+    --feedback-csv, any verified_label in predictions.csv overrides or adds labels."""
+    rows = {}
+    if METADATA.exists():
+        for row in rc.load_metadata(str(METADATA)):
+            if row["file"]:
+                rows[path_key(row["file"])] = row
+    if PREDICTIONS.exists():
+        for row in rc.load_metadata(str(PREDICTIONS)):
+            verified = (row["verified_label"] or "").strip()
+            if row["file"] and verified.casefold() in ("healthy", "degraded"):
+                rows[path_key(row["file"])] = {**row, "label": verified}
+
     out = []
-    for row in rc.load_metadata(str(METADATA)):
-        p = row["file"] and (ROOT / row["file"])
-        if p and p.exists():
-            feat = safe_features(str(p))
-            if feat:
-                out.append({**row, "path": str(p), "features": feat})
+    for row in rows.values():
+        label = (row["label"] or "").strip().casefold()
+        if label not in ("healthy", "degraded") or not Path(row["file"]).exists():
+            continue
+        feat = safe_features(row["file"])
+        if feat:
+            out.append({**row, "label": label.capitalize(), "features": feat})
     return out
+
+
+@st.cache_data(show_spinner="Training the reef model...")
+def train_model(dataset):
+    """Fit rc.LogisticRegression on all 12 features. Also returns leave-one-out
+    probabilities: each file scored by a model trained without it."""
+    X = to_matrix([d["features"] for d in dataset])
+    y = np.array([d["label"] == "Healthy" for d in dataset], dtype=float)
+    if len(set(y)) < 2:
+        return None, None
+
+    loo = np.full(len(X), np.nan)
+    for i in range(len(X)):
+        keep = np.arange(len(X)) != i
+        if len(set(y[keep])) == 2:
+            loo[i] = rc.LogisticRegression().fit(X[keep], y[keep]).predict_proba(X[i:i + 1])[0]
+    return rc.LogisticRegression().fit(X, y), loo
+
+
+def predict(model, feature_dicts):
+    return model.predict_proba(to_matrix(feature_dicts))
 
 
 def show_score(prob):
     c1, c2 = st.columns([1, 2])
-    c1.metric("Acoustic richness", f"{prob * 100:.0f} / 100")
+    c1.metric("Chance of a healthy reef", f"{prob * 100:.0f}%")
     c2.progress(min(max(prob, 0.0), 1.0))
     if prob >= 0.5:
-        c2.success("Rich soundscape: likely a good source for the playback library.")
+        c2.success("Sounds like the healthy reefs in our training data: a good source "
+                   "for the playback library.")
     else:
-        c2.warning("Quiet soundscape: possible candidate site for restoration playback.")
-    st.caption("Exploratory score from acoustic-richness features, not a trained or "
-               "validated ecological assessment.")
+        c2.warning("Sounds like the degraded reefs in our training data: possible "
+                   "candidate site for restoration playback.")
+    st.caption("Prediction from a logistic regression trained on a small labelled dataset. "
+               "Not a validated ecological assessment.")
 
 
-def feature_table(feat):
-    rows = [{"Feature": n, "Value": f"{feat[n]:.4g}", "Meaning": FEATURE_INFO[n]} for n in RICHNESS]
+def feature_table(feat, model=None):
+    """Feature values, plus how strongly the trained model leans on each one."""
+    rows = []
+    for i, n in enumerate(FEATURE_NAMES):
+        row = {"Feature": n, "Value": f"{feat[n]:.4g}", "Meaning": FEATURE_INFO[n]}
+        if model is not None:
+            w = float(model.w[i])
+            row["Model weight"] = round(w, 3)
+            row["Higher value suggests"] = "Healthy" if w > 0 else "Degraded"
+        rows.append(row)
+    if model is not None:
+        rows.sort(key=lambda r: -abs(r["Model weight"]))
     st.dataframe(rows, hide_index=True, width="stretch")
-    with st.expander("All 12 features"):
-        st.dataframe([{"Feature": n, "Value": f"{feat[n]:.4g}"} for n in FEATURE_NAMES],
-                     hide_index=True, width="stretch")
+
+
+def score_chart(table):
+    sites = sorted({t["Site"] for t in table})
+    fig, ax = plt.subplots(figsize=(8, 3))
+    order = sorted(range(len(table)), key=lambda k: table[k]["Score"])
+    palette = {s: plt.cm.tab10(k) for k, s in enumerate(sites)}
+    ax.barh([table[k]["File"] for k in order], [table[k]["Score"] for k in order],
+            color=[palette[table[k]["Site"]] for k in order])
+    ax.axvline(0.5, color="grey", ls="--", lw=1)
+    ax.set_xlim(0, 1)
+    ax.set_xlabel("Probability healthy")
+    for s in sites:
+        ax.barh([], [], color=palette[s], label=s)
+    ax.legend(loc="lower right", fontsize=8)
+    fig.set_figheight(max(3, 0.28 * len(table)))
+    fig.tight_layout()
+    st.pyplot(fig)
+
+
+def site_metrics(table):
+    sites = sorted({t["Site"] for t in table})
+    for c, s in zip(st.columns(len(sites)), sites):
+        ps = [t["Score"] for t in table if t["Site"] == s]
+        c.metric(s, f"{np.mean(ps) * 100:.0f}% healthy", f"{len(ps)} recordings", delta_color="off")
 
 
 # ------------------------------ layout ------------------------------
 dataset = load_dataset()
-ref = richness_scores([d["features"] for d in dataset])[3] if len(dataset) >= 2 else None
+model, loo = train_model(dataset) if dataset else (None, None)
+n_healthy = sum(d["label"] == "Healthy" for d in dataset)
 
 with st.sidebar:
     st.title("🪸 Coral-Reef.AI")
     st.caption("Listen. Clean. Restore.")
     st.markdown("**Status**")
-    st.write(f"Dataset files found: {len(dataset)}")
+    st.write(f"Labelled files found: {len(dataset)}")
     st.write(f"Denoising: {DENOISE_SOURCE}")
-    st.write("Scoring: reef_classifier.py")
-    if not dataset:
-        st.info("Put the WAV files in a `data/` folder (paths from metadata.csv) "
-                "to enable the dataset view and single-file scoring.")
+    if model is not None:
+        st.write(f"Model: trained on {len(dataset)} recordings "
+                 f"({n_healthy} Healthy, {len(dataset) - n_healthy} Degraded)")
+    else:
+        st.write("Model: not trained")
+        st.info("Put the WAV files in a `data/` folder (paths from metadata.csv). "
+                "The model needs readable recordings labelled both Healthy and Degraded.")
     st.divider()
     st.caption("SDG 14: Life Below Water")
 
@@ -239,74 +306,69 @@ with tab_one:
             target_path = write_wav_temp(clean, sr) if clean is not None else raw_path
             feat = safe_features(target_path)
             if feat:
-                if ref is not None:
-                    show_score(score_against_reference(feat, ref))
-                    st.caption(f"Compared against {len(dataset)} recordings in metadata.csv.")
+                if model is not None:
+                    show_score(float(predict(model, [feat])[0]))
+                    st.caption(f"Model trained on {len(dataset)} labelled recordings from "
+                               "metadata.csv. Most reliable for recordings made with the same "
+                               "equipment and settings.")
                 else:
-                    st.info("The score is relative to other recordings, so it needs the "
-                            "dataset in `data/`. Meanwhile, use the **Reef sites** tab to "
-                            "upload several files and compare them.")
-                feature_table(feat)
+                    st.info("Scoring needs the trained model, which needs the labelled WAV "
+                            "files in `data/`.")
+                feature_table(feat, model)
 
 # ------------------------------ reef sites ------------------------------
 with tab_sites:
-    st.markdown("Scores every recording in a batch, the same way as "
-                "`python reef_classifier.py --auto-label`.")
-
-    if dataset:
-        items = [{"filename": d["filename"], "site": d["site"], "features": d["features"]}
-                 for d in dataset]
-        st.caption(f"Using {len(items)} recordings from metadata.csv.")
+    if model is None:
+        st.info("No trained model yet. Put the labelled WAV files from metadata.csv in `data/`.")
+        if PREDICTIONS.exists():
+            st.markdown("Showing the last `predictions.csv` from the script:")
+            with open(PREDICTIONS, newline="") as f:
+                st.dataframe(list(csv.DictReader(f)), hide_index=True, width="stretch")
     else:
-        ups = st.file_uploader("No dataset found. Upload 2 or more WAV files to compare",
-                               type=["wav"], accept_multiple_files=True, key="batch")
+        st.markdown("#### How well does the model do?")
+        st.markdown("Each training recording is scored by a model trained on **all the "
+                    "others** (leave-one-out), so these are honest guesses, not memorised answers.")
+        table = [{"File": d["filename"], "Site": d["site"], "True label": d["label"],
+                  "Predicted": "Healthy" if p >= 0.5 else "Degraded", "Score": round(float(p), 3)}
+                 for d, p in zip(dataset, loo) if not np.isnan(p)]
+        if table:
+            correct = sum(t["True label"] == t["Predicted"] for t in table)
+            st.metric("Leave-one-out accuracy", f"{correct / len(table) * 100:.0f}%",
+                      f"{correct} of {len(table)} correct", delta_color="off")
+            site_metrics(table)
+            score_chart(table)
+            st.dataframe(table, hide_index=True, width="stretch")
+
+        st.divider()
+        st.markdown("#### Classify new recordings")
+        ups = st.file_uploader("Upload WAV files to classify", type=["wav"],
+                               accept_multiple_files=True, key="batch")
         items = []
         for u in ups or []:
             feat = safe_features(save_temp_wav(u.getvalue()))
             if feat:
                 items.append({"filename": u.name, "site": "Uploaded", "features": feat})
 
-    if len(items) >= 2:
-        score, prob, healthy, _ = richness_scores([i["features"] for i in items])
-        table = [{"File": i["filename"], "Site": i["site"],
-                  "Label": "Rich" if h else "Quiet", "Score": round(float(p), 3)}
-                 for i, p, h in zip(items, prob, healthy)]
+        if items:
+            probs = predict(model, [i["features"] for i in items])
+            new = [{"File": i["filename"], "Site": i["site"],
+                    "Predicted": "Healthy" if p >= 0.5 else "Degraded", "Score": round(float(p), 3)}
+                   for i, p in zip(items, probs)]
+            score_chart(new)
+            st.dataframe(new, hide_index=True, width="stretch")
 
-        sites = sorted({i["site"] for i in items})
-        cols = st.columns(len(sites))
-        for c, s in zip(cols, sites):
-            ps = [t["Score"] for t in table if t["Site"] == s]
-            c.metric(s, f"{np.mean(ps) * 100:.0f} / 100", f"{len(ps)} recordings", delta_color="off")
-
-        fig, ax = plt.subplots(figsize=(8, 3))
-        order = sorted(range(len(table)), key=lambda k: table[k]["Score"])
-        palette = {s: plt.cm.tab10(k) for k, s in enumerate(sites)}
-        ax.barh([table[k]["File"] for k in order], [table[k]["Score"] for k in order],
-                color=[palette[table[k]["Site"]] for k in order])
-        ax.axvline(0.5, color="grey", ls="--", lw=1)
-        ax.set_xlim(0, 1)
-        ax.set_xlabel("Acoustic richness score")
-        for s in sites:
-            ax.barh([], [], color=palette[s], label=s)
-        ax.legend(loc="lower right", fontsize=8)
-        fig.set_figheight(max(3, 0.28 * len(table)))
-        fig.tight_layout()
-        st.pyplot(fig)
-
-        st.dataframe(table, hide_index=True, width="stretch")
-
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["filename", "predicted_label", "probability_healthy"])
-        for t, h in zip(table, healthy):
-            w.writerow([t["File"], "Healthy" if h else "Degraded", f"{t['Score']:.3f}"])
-        st.download_button("⬇️ Download predictions.csv", buf.getvalue(), file_name="predictions.csv")
-        st.caption("Labels split the batch at its median, so about half are always 'Rich'. "
-                   "Exploratory only.")
-    elif PREDICTIONS.exists():
-        st.markdown("Showing the last `predictions.csv` from the script:")
-        with open(PREDICTIONS, newline="") as f:
-            st.dataframe(list(csv.DictReader(f)), hide_index=True, width="stretch")
+            # Same columns as reef_classifier.py's supervised output
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(["file_path", "filename", "site", "predicted_label",
+                        "probability_healthy", "verified_label"])
+            for t in new:
+                w.writerow([f"data/{t['File']}", t["File"], t["Site"], t["Predicted"],
+                            f"{t['Score']:.3f}", ""])
+            st.download_button("⬇️ Download predictions.csv", buf.getvalue(), file_name="predictions.csv")
+            st.caption("To teach the model: copy the WAVs into `data/`, fill in `verified_label` "
+                       "(Healthy or Degraded), and save the CSV as `predictions.csv` in the app "
+                       "folder. The app retrains on them next time it starts.")
 
 # ------------------------------ buoy ------------------------------
 with tab_buoy:
@@ -344,12 +406,14 @@ measures and adapts**: it tracks the reef's soundscape score and changes what it
 when. It's low-cost and autonomous, so restoration teams can use it across many sites.
 
 ### How the score works
-We extract 12 bioacoustic features from each recording. Four of them (acoustic complexity,
-spectral entropy, snapping-shrimp band and fish band) are combined into an acoustic-richness
-score, compared across recordings.
+We extract 12 bioacoustic features from each recording (loudness, pitch, snapping-shrimp
+and fish frequency bands, acoustic complexity and more). A logistic regression model learns
+from recordings labelled Healthy or Degraded which combination of features tells them apart,
+then gives new recordings a probability of being healthy. Experts can correct its predictions,
+and the model retrains on those corrections.
 
 ### Our honest position
 Sound doesn't cure bleaching. It can help reefs recover faster by attracting fish and coral
-larvae once conditions allow. The score is exploratory, and we aim to validate it with
-marine biologists.
+larvae once conditions allow. The model is trained on only a few reefs, and we aim to
+validate it with marine biologists.
 """)
