@@ -57,12 +57,26 @@ def trim_silence(x, sr, top_db=40):
     frame = max(1, int(0.1 * sr))
     if len(x) < frame:
         return x
-    kernel = np.ones(frame) / frame
-    energy = np.convolve(x ** 2, kernel, mode="same")
-    rms = np.sqrt(np.maximum(energy, 0.0))
+    # Moving average of x**2, same as np.convolve(x**2, ones(frame)/frame, "same")
+    # but via a running sum, which is much faster and lighter on long recordings
+    n, h = len(x), (frame - 1) // 2
+    lead = frame - 1 - h
+    c = np.empty(n + 1)
+    c[0] = 0.0
+    np.cumsum(x * x, out=c[1:])
+    energy = np.empty(n)
+    energy[:n - h] = c[h + 1:]
+    energy[n - h:] = c[-1]
+    energy[lead:] -= c[:n - lead]
+    energy /= frame
+    del c
+    rms = np.sqrt(np.maximum(energy, 0.0, out=energy), out=energy)
     thr = rms.max() * (10 ** (-top_db / 20))
-    idx = np.where(rms > thr)[0]
-    return x[idx[0]:idx[-1]+1] if len(idx) else x
+    loud = rms > thr
+    if not loud.any():
+        return x
+    first, last = loud.argmax(), n - 1 - loud[::-1].argmax()
+    return x[first:last+1]
 
 
 def load_audio(path):
@@ -77,7 +91,9 @@ def load_audio(path):
     if x.dtype == np.uint8:
         x = (x.astype(np.float64) - 128) / 128
     elif np.issubdtype(x.dtype, np.integer):
-        x = x.astype(np.float64) / -np.iinfo(x.dtype).min
+        scale = -np.iinfo(x.dtype).min
+        x = x.astype(np.float64)
+        x /= scale
     else:
         x = x.astype(np.float64)
 
@@ -120,11 +136,17 @@ def stft(x, sr, win_ms=50, hop_ms=12.5, nfft=1024):
         n = win
 
     n_frames = 1 + (n - win) // hop
-    starts = np.arange(n_frames) * hop
-    window = np.hanning(win)
-    idx = np.arange(win)[None, :] + starts[:, None]
-    segs = x[idx].T * window[:, None]
-    S = np.abs(np.fft.rfft(segs, n=nfft, axis=0))
+    # rfft(n=nfft) only reads the first nfft samples of each windowed frame
+    used = min(win, nfft)
+    window = np.hanning(win)[:used]
+    S = np.empty((nfft // 2 + 1, n_frames))
+    # Work in blocks of frames so long recordings don't need gigabytes of RAM
+    block = 2000
+    for a in range(0, n_frames, block):
+        starts = np.arange(a, min(a + block, n_frames)) * hop
+        idx = np.arange(used)[None, :] + starts[:, None]
+        segs = x[idx].T * window[:, None]
+        S[:, a:a + len(starts)] = np.abs(np.fft.rfft(segs, n=nfft, axis=0))
     freqs = np.fft.rfftfreq(nfft, 1 / sr)
     return S, freqs
 
@@ -144,7 +166,8 @@ def aci(S):
     """Acoustic Complexity Index."""
     if S.shape[1] < 2:
         return 0.0
-    d = np.abs(np.diff(S, axis=1))
+    d = np.diff(S, axis=1)
+    np.abs(d, out=d)
     return float(d.sum() / (S.shape[0] * S.shape[1]))
 
 
@@ -156,10 +179,10 @@ def extract_features(path):
     sr, x = audio
 
     S, freqs = stft(x, sr)
-    P = np.mean(S ** 2, axis=1) + 1e-12
+    P = np.einsum("ij,ij->i", S, S) / S.shape[1] + 1e-12  # mean of S**2 per row
     total_power = P.sum()
 
-    rms = float(np.sqrt(np.mean(x ** 2)) + 1e-12)
+    rms = float(np.sqrt(np.dot(x, x) / np.float64(len(x))) + 1e-12)
     rms_db = 20 * math.log10(rms) if rms > 0 else -999.0
 
     centroid = float(np.sum(freqs * P) / total_power)
@@ -183,9 +206,8 @@ def extract_features(path):
 
     zcr_val = 0.0
     if len(x) > 1:
-        signs = np.sign(x)
-        signs[signs == 0] = 1
-        zcr_val = float(np.mean(signs[:-1] != signs[1:]))
+        neg = x < 0  # zero counts as positive, as before
+        zcr_val = float(np.mean(neg[:-1] != neg[1:]))
     complexity = aci(S)
 
     return {

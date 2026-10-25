@@ -103,9 +103,7 @@ def safe_load(path):
 
 def safe_features(path):
     try:
-        if rc.load_audio(path) is None:
-            return None
-        return rc.extract_features(path)
+        return rc.extract_features(path)  # None if the file can't be read
     except Exception as e:  # unreadable or odd WAV format
         st.warning(f"Could not analyse {Path(path).name}: {e}")
         return None
@@ -113,6 +111,7 @@ def safe_features(path):
 
 def spectrogram_fig(x, sr, title):
     S, freqs = rc.stft(x, sr)
+    S = S[:, ::max(1, S.shape[1] // 2000)]  # a plot only needs ~2000 time columns
     db = 20 * np.log10(S + 1e-9)
     db -= db.max()
     duration = len(x) / sr
