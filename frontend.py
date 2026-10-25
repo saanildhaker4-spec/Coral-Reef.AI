@@ -30,7 +30,9 @@ ROOT = Path(__file__).parent
 METADATA = ROOT / "metadata.csv"
 PREDICTIONS = ROOT / "predictions.csv"
 BUOY_IMAGE = ROOT / "assets" / "buoy.png"
-BUOY_MODEL = next(iter(sorted((ROOT / "assets").glob("*.stl"))), None)  # Tinkercad STL export
+# Tinkercad OBJ export: a folder holding the .obj and its obj.mtl colours
+BUOY_MTL = next(iter(sorted((ROOT / "assets").rglob("*.mtl"))), None)
+BUOY_OBJ = next(iter(sorted(BUOY_MTL.parent.glob("*.obj"))), None) if BUOY_MTL else None
 
 # Same order reef_classifier.main() uses for the model's inputs
 FEATURE_NAMES = [
@@ -231,41 +233,43 @@ def score_chart(table):
     st.pyplot(fig)
 
 
-def stl_viewer(path, height=450):
-    """Interactive 3D view of an STL file (three.js): drag to rotate, scroll to zoom."""
-    data = base64.b64encode(path.read_bytes()).decode()
+def model_viewer(obj_path, mtl_path, height=450):
+    """Interactive 3D view of a coloured OBJ (three.js): drag to rotate, scroll to zoom."""
+    obj = base64.b64encode(obj_path.read_bytes()).decode()
+    mtl = base64.b64encode(mtl_path.read_bytes()).decode()
     three = "https://cdn.jsdelivr.net/npm/three@0.147.0"
     components.html(f"""
 <div id="v" style="width:100%;height:{height}px"></div>
 <script src="{three}/build/three.min.js"></script>
-<script src="{three}/examples/js/loaders/STLLoader.js"></script>
+<script src="{three}/examples/js/loaders/MTLLoader.js"></script>
+<script src="{three}/examples/js/loaders/OBJLoader.js"></script>
 <script src="{three}/examples/js/controls/OrbitControls.js"></script>
 <script>
 const el = document.getElementById("v");
 const renderer = new THREE.WebGLRenderer({{antialias: true}});
 renderer.setPixelRatio(window.devicePixelRatio);
+renderer.outputEncoding = THREE.sRGBEncoding;  // MTL colours are converted to linear
 renderer.setSize(el.clientWidth, {height});
 el.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xe8f3f7);
-scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.9));
-const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const sun = new THREE.DirectionalLight(0xffffff, 0.45);
 sun.position.set(1, 2, 3);
 scene.add(sun);
 
-const bytes = Uint8Array.from(atob("{data}"), c => c.charCodeAt(0));
-const geom = new THREE.STLLoader().parse(bytes.buffer);
-geom.computeVertexNormals();
-geom.center();
-geom.computeBoundingSphere();
-const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({{color: 0xf28c28, roughness: 0.6}}));
-mesh.rotation.x = -Math.PI / 2;  // Tinkercad is Z-up, three.js is Y-up
-scene.add(mesh);
+const materials = new THREE.MTLLoader().parse(atob("{mtl}"), "");
+materials.preload();
+const model = new THREE.OBJLoader().setMaterials(materials).parse(atob("{obj}"));
+model.rotation.x = -Math.PI / 2;  // Tinkercad is Z-up, three.js is Y-up
+const box = new THREE.Box3().setFromObject(model);
+model.position.sub(box.getCenter(new THREE.Vector3()));
+scene.add(model);
 
-const r = geom.boundingSphere.radius;
+const r = box.getSize(new THREE.Vector3()).length() / 2;
 const camera = new THREE.PerspectiveCamera(45, el.clientWidth / {height}, r / 100, r * 100);
-camera.position.set(r * 1.1, r * 0.8, r * 1.5);
+camera.position.set(r * 1.3, r * 0.9, r * 1.8);
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.autoRotate = true;
@@ -429,14 +433,14 @@ with tab_sites:
 # ------------------------------ buoy ------------------------------
 with tab_buoy:
     st.markdown("### Concept design: Coral-Reef.AI buoy")
-    if BUOY_MODEL:
-        stl_viewer(BUOY_MODEL)
+    if BUOY_OBJ:
+        model_viewer(BUOY_OBJ, BUOY_MTL)
         st.caption("3D model from Tinkercad. Drag to rotate, scroll to zoom.")
     if BUOY_IMAGE.exists():
         st.image(str(BUOY_IMAGE), width="stretch")
-    elif not BUOY_MODEL:
-        st.info("Add your Tinkercad export as `assets/*.stl` (or a screenshot as "
-                "`assets/buoy.png`) to show it here.")
+    elif not BUOY_OBJ:
+        st.info("Unzip your Tinkercad OBJ export into a folder in `assets/` (or add a "
+                "screenshot as `assets/buoy.png`) to show it here.")
 
     m1, m2 = st.columns(2)
     m1.markdown("**🌞 Listen mode (day)**\n\nRecords the reef and tracks its score over time.")
