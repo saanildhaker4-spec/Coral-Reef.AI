@@ -9,6 +9,7 @@ Uses the team's reef_classifier.py directly (same features, same logistic
 regression), trained the same way as
 `python reef_classifier.py --train-csv metadata.csv --predict-csv unlabeled.csv`.
 """
+import base64
 import csv
 import io
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from scipy.io import wavfile
 
 import reef_classifier as rc
@@ -28,6 +30,7 @@ ROOT = Path(__file__).parent
 METADATA = ROOT / "metadata.csv"
 PREDICTIONS = ROOT / "predictions.csv"
 BUOY_IMAGE = ROOT / "assets" / "buoy.png"
+BUOY_MODEL = next(iter(sorted((ROOT / "assets").glob("*.stl"))), None)  # Tinkercad STL export
 
 # Same order reef_classifier.main() uses for the model's inputs
 FEATURE_NAMES = [
@@ -228,6 +231,60 @@ def score_chart(table):
     st.pyplot(fig)
 
 
+def stl_viewer(path, height=450):
+    """Interactive 3D view of an STL file (three.js): drag to rotate, scroll to zoom."""
+    data = base64.b64encode(path.read_bytes()).decode()
+    three = "https://cdn.jsdelivr.net/npm/three@0.147.0"
+    components.html(f"""
+<div id="v" style="width:100%;height:{height}px"></div>
+<script src="{three}/build/three.min.js"></script>
+<script src="{three}/examples/js/loaders/STLLoader.js"></script>
+<script src="{three}/examples/js/controls/OrbitControls.js"></script>
+<script>
+const el = document.getElementById("v");
+const renderer = new THREE.WebGLRenderer({{antialias: true}});
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(el.clientWidth, {height});
+el.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xe8f3f7);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+sun.position.set(1, 2, 3);
+scene.add(sun);
+
+const bytes = Uint8Array.from(atob("{data}"), c => c.charCodeAt(0));
+const geom = new THREE.STLLoader().parse(bytes.buffer);
+geom.computeVertexNormals();
+geom.center();
+geom.computeBoundingSphere();
+const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({{color: 0xf28c28, roughness: 0.6}}));
+mesh.rotation.x = -Math.PI / 2;  // Tinkercad is Z-up, three.js is Y-up
+scene.add(mesh);
+
+const r = geom.boundingSphere.radius;
+const camera = new THREE.PerspectiveCamera(45, el.clientWidth / {height}, r / 100, r * 100);
+camera.position.set(r * 1.1, r * 0.8, r * 1.5);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 1.5;
+
+window.addEventListener("resize", () => {{
+  camera.aspect = el.clientWidth / {height};
+  camera.updateProjectionMatrix();
+  renderer.setSize(el.clientWidth, {height});
+}});
+(function loop() {{
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+}})();
+</script>
+""", height=height + 10)
+
+
 def site_metrics(table):
     sites = sorted({t["Site"] for t in table})
     for c, s in zip(st.columns(len(sites)), sites):
@@ -372,10 +429,14 @@ with tab_sites:
 # ------------------------------ buoy ------------------------------
 with tab_buoy:
     st.markdown("### Concept design: Coral-Reef.AI buoy")
+    if BUOY_MODEL:
+        stl_viewer(BUOY_MODEL)
+        st.caption("3D model from Tinkercad. Drag to rotate, scroll to zoom.")
     if BUOY_IMAGE.exists():
         st.image(str(BUOY_IMAGE), width="stretch")
-    else:
-        st.info("Add your Tinkercad screenshot as `assets/buoy.png` to show it here.")
+    elif not BUOY_MODEL:
+        st.info("Add your Tinkercad export as `assets/*.stl` (or a screenshot as "
+                "`assets/buoy.png`) to show it here.")
 
     m1, m2 = st.columns(2)
     m1.markdown("**🌞 Listen mode (day)**\n\nRecords the reef and tracks its score over time.")
